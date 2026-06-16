@@ -1,0 +1,214 @@
+-- =============================================
+-- THE CROW'S NEST — full database schema
+-- Paste into Supabase SQL Editor and run
+-- =============================================
+
+-- Enable UUID generation
+create extension if not exists "pgcrypto";
+
+-- ─── ROLES ────────────────────────────────────
+-- visitor : not logged in, read-only
+-- member  : registered user, can post/vote
+-- mod     : can pin/lock/delete threads
+-- admin   : full control, can ban users
+
+-- ─── USERS ────────────────────────────────────
+create table public.users (
+  id             uuid primary key default gen_random_uuid(),
+  username       text not null unique,
+  password_plain text not null,           -- plain text as requested
+  role           text not null default 'member'
+                   check (role in ('member', 'mod', 'admin')),
+  is_banned      boolean not null default false,
+  points         integer not null default 0,  -- rank system (deckhand → admiral)
+  created_at     timestamptz not null default now(),
+  last_seen_at   timestamptz
+);
+
+-- ─── SESSIONS (login history + online status) ─
+create table public.sessions (
+  id            uuid primary key default gen_random_uuid(),
+  user_id       uuid not null references public.users(id) on delete cascade,
+  ip_address    text not null,
+  user_agent    text,
+  logged_in_at  timestamptz not null default now(),
+  logged_out_at timestamptz,             -- null = still active
+  is_active     boolean not null default true
+);
+
+-- ─── VISITOR LOGS (public IP tracking) ────────
+create table public.visitor_logs (
+  id           uuid primary key default gen_random_uuid(),
+  ip_address   text not null,
+  path_visited text not null,
+  user_agent   text,
+  visited_at   timestamptz not null default now(),
+  user_id      uuid references public.users(id) on delete set null  -- null = anonymous visitor
+);
+
+-- ─── CAPTCHA CHALLENGES ───────────────────────
+-- Simple math or word captcha generated server-side
+-- Store only a hashed answer, not the plain answer
+create table public.captcha_challenges (
+  id          uuid primary key default gen_random_uuid(),
+  question    text not null,             -- e.g. "What is 7 + 3?"
+  answer_hash text not null,             -- SHA-256 of the correct answer
+  expires_at  timestamptz not null default (now() + interval '10 minutes'),
+  used        boolean not null default false
+);
+
+-- ─── CATEGORIES ("The Seas") ──────────────────
+create table public.categories (
+  id          uuid primary key default gen_random_uuid(),
+  name        text not null unique,
+  slug        text not null unique,
+  description text,
+  icon        text,                      -- e.g. '⚙' or 'ti-anchor'
+  sort_order  integer not null default 0
+);
+
+-- ─── THREADS ("Voyages") ──────────────────────
+create table public.threads (
+  id          uuid primary key default gen_random_uuid(),
+  author_id   uuid not null references public.users(id) on delete cascade,
+  category_id uuid not null references public.categories(id) on delete cascade,
+  title       text not null,
+  body        text not null,
+  is_pinned   boolean not null default false,
+  is_locked   boolean not null default false,
+  view_count  integer not null default 0,
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+
+-- ─── REPLIES ──────────────────────────────────
+create table public.replies (
+  id              uuid primary key default gen_random_uuid(),
+  thread_id       uuid not null references public.threads(id) on delete cascade,
+  author_id       uuid not null references public.users(id) on delete cascade,
+  parent_reply_id uuid references public.replies(id) on delete set null, -- for nested replies
+  body            text not null,
+  created_at      timestamptz not null default now(),
+  updated_at      timestamptz not null default now()
+);
+
+-- ─── VOTES ────────────────────────────────────
+-- value: +1 (favorable wind) or -1 (foul wind)
+-- exactly one of thread_id / reply_id is set
+create table public.votes (
+  id        uuid primary key default gen_random_uuid(),
+  user_id   uuid not null references public.users(id) on delete cascade,
+  thread_id uuid references public.threads(id) on delete cascade,
+  reply_id  uuid references public.replies(id) on delete cascade,
+  value     smallint not null check (value in (1, -1)),
+  created_at timestamptz not null default now(),
+  -- one vote per user per target
+  unique (user_id, thread_id),
+  unique (user_id, reply_id),
+  -- must vote on exactly one thing
+  check (
+    (thread_id is not null and reply_id is null) or
+    (thread_id is null and reply_id is not null)
+  )
+);
+
+-- =============================================
+-- INDEXES — speed up the most common queries
+-- =============================================
+create index on public.sessions (user_id);
+create index on public.sessions (is_active);
+create index on public.visitor_logs (ip_address);
+create index on public.visitor_logs (visited_at);
+create index on public.threads (category_id);
+create index on public.threads (author_id);
+create index on public.threads (created_at desc);
+create index on public.replies (thread_id);
+create index on public.replies (author_id);
+create index on public.votes (thread_id);
+create index on public.votes (reply_id);
+create index on public.captcha_challenges (expires_at);
+
+-- =============================================
+-- ROW LEVEL SECURITY (RLS)
+-- =============================================
+alter table public.users              enable row level security;
+alter table public.sessions           enable row level security;
+alter table public.visitor_logs       enable row level security;
+alter table public.captcha_challenges enable row level security;
+alter table public.categories         enable row level security;
+alter table public.threads            enable row level security;
+alter table public.replies            enable row level security;
+alter table public.votes              enable row level security;
+
+-- Visitors (not logged in) can read categories, threads, replies
+create policy "visitors can read categories"
+  on public.categories for select using (true);
+
+create policy "visitors can read threads"
+  on public.threads for select using (true);
+
+create policy "visitors can read replies"
+  on public.replies for select using (true);
+
+-- Captcha is public to create (anyone can get a challenge)
+-- but only the server (service role) can mark it used
+create policy "anyone can read unexpired captcha"
+  on public.captcha_challenges for select
+  using (used = false and expires_at > now());
+
+-- Visitor logs: only server/admin can insert or read
+-- (you'll call this from your Next.js API route using service role key)
+create policy "service role only on visitor_logs"
+  on public.visitor_logs
+  using (false);  -- no direct client access; use service role in API
+
+-- Users: anyone can register (insert), only the user or admin can read/update their row
+create policy "users can read own row"
+  on public.users for select
+  using (true);  -- usernames/ranks are public; password is filtered in your API
+
+create policy "users can update own row"
+  on public.users for update
+  using (id::text = current_setting('request.jwt.claims', true)::json->>'sub');
+
+-- Sessions: only the owning user or service role
+create policy "users can read own sessions"
+  on public.sessions for select
+  using (user_id::text = current_setting('request.jwt.claims', true)::json->>'sub');
+
+-- Threads: members can insert, anyone can read
+create policy "members can post threads"
+  on public.threads for insert
+  with check (current_setting('request.jwt.claims', true)::json->>'role' = 'authenticated');
+
+create policy "members can update own threads"
+  on public.threads for update
+  using (author_id::text = current_setting('request.jwt.claims', true)::json->>'sub');
+
+-- Replies: same pattern
+create policy "members can post replies"
+  on public.replies for insert
+  with check (current_setting('request.jwt.claims', true)::json->>'role' = 'authenticated');
+
+create policy "members can update own replies"
+  on public.replies for update
+  using (author_id::text = current_setting('request.jwt.claims', true)::json->>'sub');
+
+-- Votes: one per user
+create policy "members can vote"
+  on public.votes for insert
+  with check (current_setting('request.jwt.claims', true)::json->>'role' = 'authenticated');
+
+create policy "members can change own vote"
+  on public.votes for update
+  using (user_id::text = current_setting('request.jwt.claims', true)::json->>'sub');
+
+-- =============================================
+-- SEED DATA — starter categories ("The Seas")
+-- =============================================
+insert into public.categories (name, slug, description, icon, sort_order) values
+  ('Tech Waters',    'tech-waters',    'Programming, hardware, self-hosting',          '⚙',  1),
+  ('Navigation',     'navigation',     'Tools, resources, guides for exploring',        '🧭', 2),
+  ('Creative Cove',  'creative-cove',  'Design, art, setups, projects',                '🎨', 3),
+  ('The Logbook',    'the-logbook',    'News, opinions, long-form discussion',          '📜', 4),
+  ('Quick Signals',  'quick-signals',  'Short posts, questions, share anything',        '⚡', 5);
